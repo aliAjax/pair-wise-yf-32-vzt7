@@ -54,6 +54,73 @@ class OrganFlowTest(unittest.TestCase):
         with self.assertRaises(ApiError) as ctx:
             self.svc.mark_transit(allocation["id"], "allocator", "allocation_officer", {"cold_chain_temp": 12})
         self.assertEqual(ctx.exception.code, "cold_chain_violation")
+    def test_response_deadline_validation(self):
+        donor, candidate = self.donor(), self.candidate()
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": candidate["id"], "response_deadline": iso(self.now - timedelta(hours=1))})
+        self.assertEqual(ctx.exception.code, "invalid_deadline")
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": candidate["id"], "response_deadline": iso(self.now + timedelta(days=3))})
+        self.assertEqual(ctx.exception.code, "invalid_deadline")
+
+    def test_response_deadline_and_deferral(self):
+        donor = self.donor()
+        first = self.candidate("患者甲", "H2", 5, 500)
+        second = self.candidate("患者乙", "H3", 4, 300)
+        self.candidate("患者丙", "H4", 3, 100)
+        allocation = self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": first["id"], "response_deadline": iso(self.now + timedelta(hours=1))})
+        self.assertEqual(allocation["deferral_count"], 0)
+        self.assertIsNotNone(allocation["response_deadline"])
+        past = iso(self.now - timedelta(minutes=1))
+        self.svc.repo.conn.execute("UPDATE allocations SET response_deadline=? WHERE id=?", (past, allocation["id"]))
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.accept(allocation["id"], "hospital-h2", "hospital", "H2", {"expected_revision": 1})
+        self.assertEqual(ctx.exception.code, "offer_expired")
+        state = self.svc.state("coord", "coordinator", "")
+        current = next(a for a in state["allocations"] if a["id"] == allocation["id"])
+        self.assertEqual(current["candidate_id"], second["id"])
+        self.assertEqual(current["deferral_count"], 1)
+        self.assertEqual(current["current_hospital"], "H3")
+        self.assertIsNotNone(current["response_deadline"])
+        detail = self.svc.get_allocation(allocation["id"], "allocation_officer", "")
+        self.assertEqual(len(detail["defers"]), 1)
+        defer = detail["defers"][0]
+        self.assertEqual((defer["from_candidate_id"], defer["to_candidate_id"]), (first["id"], second["id"]))
+        self.assertEqual((defer["from_hospital"], defer["to_hospital"]), ("H2", "H3"))
+        self.assertTrue(defer["reason"] and defer["created_at"])
+        with self.assertRaises(ApiError) as ctx:
+            self.svc.accept(allocation["id"], "hospital-h2", "hospital", "H2", {"expected_revision": current["revision"]})
+        self.assertEqual(ctx.exception.code, "wrong_hospital")
+        accepted = self.svc.accept(allocation["id"], "hospital-h3", "hospital", "H3", {"expected_revision": current["revision"]})
+        self.assertEqual(accepted["status"], "accepted")
+        actions = [item["action"] for item in self.svc.audit(allocation["id"], "auditor")]
+        self.assertEqual(actions, ["allocation_proposed", "allocation_deferred", "allocation_accepted"])
+
+    def test_deferral_exhaustion_releases_donor(self):
+        donor = self.donor()
+        first = self.candidate("患者甲", "H2", 5, 500)
+        second = self.candidate("患者乙", "H3", 4, 300)
+        allocation = self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": first["id"], "response_deadline": iso(self.now + timedelta(hours=1))})
+        past = iso(self.now - timedelta(minutes=1))
+        self.svc.repo.conn.execute("UPDATE allocations SET response_deadline=? WHERE id=?", (past, allocation["id"]))
+        state = self.svc.state("coord", "coordinator", "")
+        current = next(a for a in state["allocations"] if a["id"] == allocation["id"])
+        self.assertEqual((current["candidate_id"], current["deferral_count"]), (second["id"], 1))
+        self.svc.repo.conn.execute("UPDATE allocations SET response_deadline=? WHERE id=?", (past, allocation["id"]))
+        state = self.svc.state("coord", "coordinator", "")
+        current = next(a for a in state["allocations"] if a["id"] == allocation["id"])
+        self.assertEqual(current["status"], "withdrawn")
+        donor_row = next(d for d in state["donors"] if d["id"] == donor["id"])
+        self.assertEqual(donor_row["status"], "available")
+        actions = [item["action"] for item in self.svc.audit(allocation["id"], "auditor")]
+        self.assertEqual(actions, ["allocation_proposed", "allocation_deferred", "allocation_lapsed"])
+
+    def test_allocation_without_deadline_unchanged(self):
+        donor, candidate = self.donor(), self.candidate()
+        allocation = self.svc.propose("allocator", "allocation_officer", {"donor_id": donor["id"], "candidate_id": candidate["id"]})
+        self.assertIsNone(allocation["response_deadline"])
+        accepted = self.svc.accept(allocation["id"], "hospital-h2", "hospital", "H2", {"expected_revision": 1})
+        self.assertEqual(accepted["status"], "accepted")
 
 
 if __name__ == "__main__": unittest.main()

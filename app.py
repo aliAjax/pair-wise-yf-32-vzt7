@@ -7,7 +7,7 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -61,7 +61,14 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, donor_id INTEGER NOT NULL UNIQUE REFERENCES donors(id), candidate_id INTEGER NOT NULL REFERENCES candidates(id),
             score REAL NOT NULL, status TEXT NOT NULL DEFAULT 'proposed', revision INTEGER NOT NULL DEFAULT 1,
             cold_chain_temp REAL, delayed_minutes INTEGER NOT NULL DEFAULT 0, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, accepted_at TEXT, implanted_at TEXT
+            updated_at TEXT NOT NULL, accepted_at TEXT, implanted_at TEXT,
+            response_deadline TEXT, response_window_sec INTEGER, deferral_count INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS allocation_defers(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER NOT NULL REFERENCES allocations(id),
+            from_candidate_id INTEGER NOT NULL, from_hospital TEXT NOT NULL,
+            to_candidate_id INTEGER NOT NULL, to_hospital TEXT NOT NULL,
+            reason TEXT NOT NULL, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS handoffs(
             id INTEGER PRIMARY KEY AUTOINCREMENT, allocation_id INTEGER NOT NULL REFERENCES allocations(id), from_hospital TEXT NOT NULL,
@@ -74,6 +81,11 @@ class Repository:
             action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
         """)
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(allocations)")}
+        for column, ddl in (("response_deadline", "ALTER TABLE allocations ADD COLUMN response_deadline TEXT"),
+                            ("response_window_sec", "ALTER TABLE allocations ADD COLUMN response_window_sec INTEGER"),
+                            ("deferral_count", "ALTER TABLE allocations ADD COLUMN deferral_count INTEGER NOT NULL DEFAULT 0")):
+            if column not in existing: self.conn.execute(ddl)
 
     @contextmanager
     def tx(self):
@@ -168,12 +180,19 @@ class OrganAllocationService:
                 raise ApiError(409, "medical_mismatch", "器官类型或血型不匹配")
             if conn.execute("SELECT 1 FROM allocations WHERE donor_id=? AND status NOT IN ('withdrawn','expired')", (donor_id,)).fetchone():
                 raise ApiError(409, "already_allocated", "该器官已有有效分配")
+            deadline_iso, window_sec = None, None
+            if body.get("response_deadline") is not None:
+                deadline = parse_time(str(body["response_deadline"]))
+                if deadline <= utcnow(): raise ApiError(400, "invalid_deadline", "应答截止时间必须晚于当前时间")
+                if deadline > parse_time(donor["expires_at"]): raise ApiError(400, "invalid_deadline", "应答截止时间不能晚于器官可用结束时间")
+                deadline_iso, window_sec = iso(deadline), int((deadline - utcnow()).total_seconds())
             score = self._score(donor, candidate)
-            cur = conn.execute("""INSERT INTO allocations(donor_id,candidate_id,score,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?)""",
-                               (donor_id, candidate_id, score["total"], actor, iso(), iso()))
+            cur = conn.execute("""INSERT INTO allocations(donor_id,candidate_id,score,response_deadline,response_window_sec,created_by,created_at,updated_at)
+                                  VALUES(?,?,?,?,?,?,?,?)""",
+                               (donor_id, candidate_id, score["total"], deadline_iso, window_sec, actor, iso(), iso()))
             allocation_id = cur.lastrowid
             conn.execute("UPDATE donors SET status='allocated',revision=revision+1 WHERE id=?", (donor_id,))
-            Repository.audit(conn, allocation_id, donor_id, actor, role, "allocation_proposed", {"candidate_id": candidate_id, "score": score})
+            Repository.audit(conn, allocation_id, donor_id, actor, role, "allocation_proposed", {"candidate_id": candidate_id, "score": score, "response_deadline": deadline_iso})
             return self._allocation(conn, allocation_id, role, "")
 
     def _allocation(self, conn: sqlite3.Connection, allocation_id: int, role: str, hospital: str) -> dict[str, Any]:
@@ -187,6 +206,7 @@ class OrganAllocationService:
         if role == "hospital" and hospital != row["candidate_hospital"]:
             result["patient_name"] = "***"
         result["handoff"] = self._row(conn.execute("SELECT * FROM handoffs WHERE allocation_id=?", (allocation_id,)).fetchone())
+        result["defers"] = [dict(r) for r in conn.execute("SELECT * FROM allocation_defers WHERE allocation_id=? ORDER BY id", (allocation_id,))]
         return result
 
     def _ensure_active(self, conn: sqlite3.Connection, allocation_id: int, actor: str, role: str) -> sqlite3.Row:
@@ -211,6 +231,8 @@ class OrganAllocationService:
             if candidate["hospital"] != hospital: raise ApiError(403, "wrong_hospital", "只能由候选患者所在医院接受")
             if row["status"] == "accepted": return self._allocation(conn, allocation_id, role, hospital)
             if row["status"] != "proposed": raise ApiError(409, "invalid_transition", "当前状态不能接受")
+            if row["response_deadline"] and parse_time(row["response_deadline"]) <= utcnow():
+                raise ApiError(409, "offer_expired", "应答期限已过，本次分配机会已失去，协调台将按原排序顺延给下一位候选患者")
             if row["revision"] != expected: raise ApiError(409, "revision_conflict", "分配信息已发生变化")
             conn.execute("UPDATE allocations SET status='accepted',accepted_at=?,revision=revision+1,updated_at=? WHERE id=?", (iso(), iso(), allocation_id))
             Repository.audit(conn, allocation_id, row["donor_id"], actor, role, "allocation_accepted", {"hospital": hospital})
@@ -305,12 +327,57 @@ class OrganAllocationService:
         if role not in {"auditor", "allocation_officer"}: raise ApiError(403, "audit_forbidden", "当前角色不能查看审计记录")
         return [dict(r) for r in self.repo.conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE allocation_id=? ORDER BY id", (allocation_id,))]
 
-    def state(self, role: str, hospital: str) -> dict[str, Any]:
+    def _sweep_deferrals(self, conn: sqlite3.Connection, actor: str, role: str) -> None:
+        now = utcnow()
+        lapsed = conn.execute("SELECT * FROM allocations WHERE status='proposed' AND response_deadline IS NOT NULL").fetchall()
+        for row in lapsed:
+            if parse_time(row["response_deadline"]) > now: continue
+            donor = conn.execute("SELECT * FROM donors WHERE id=?", (row["donor_id"],)).fetchone()
+            if parse_time(donor["expires_at"]) <= now:
+                conn.execute("UPDATE allocations SET status='expired',revision=revision+1,updated_at=? WHERE id=?", (iso(), row["id"]))
+                conn.execute("UPDATE donors SET status='expired',revision=revision+1 WHERE id=?", (donor["id"],))
+                Repository.audit(conn, row["id"], donor["id"], actor, role, "allocation_expired", {"reason": "organ_window_elapsed"})
+                continue
+            refused = {r["from_candidate_id"] for r in conn.execute("SELECT from_candidate_id FROM allocation_defers WHERE allocation_id=?", (row["id"],))}
+            refused.add(row["candidate_id"])
+            ranked = []
+            for candidate in conn.execute("SELECT * FROM candidates WHERE organ=? AND status='active' AND willing=1", (donor["organ"],)):
+                if blood_compatible(donor["blood_type"], candidate["blood_type"]):
+                    ranked.append((self._score(donor, candidate)["total"], candidate["id"], candidate))
+            ranked.sort(key=lambda item: (-item[0], item[1]))
+            positions = [index for index, (_, _, candidate) in enumerate(ranked) if candidate["id"] == row["candidate_id"]]
+            start = positions[0] + 1 if positions else 0
+            nxt = next((candidate for _, _, candidate in ranked[start:] if candidate["id"] not in refused), None)
+            if nxt is None:
+                conn.execute("UPDATE allocations SET status='withdrawn',revision=revision+1,updated_at=? WHERE id=?", (iso(), row["id"]))
+                conn.execute("UPDATE donors SET status='available',revision=revision+1 WHERE id=?", (donor["id"],))
+                Repository.audit(conn, row["id"], donor["id"], actor, role, "allocation_lapsed",
+                                 {"candidate_id": row["candidate_id"], "reason": "应答期限已过且无其他符合条件候选"})
+                continue
+            previous = conn.execute("SELECT * FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+            new_deadline = None
+            if row["response_window_sec"]:
+                new_deadline = iso(min(now + timedelta(seconds=row["response_window_sec"]), parse_time(donor["expires_at"])))
+            reason = "接收医院未在应答期限内确认"
+            conn.execute("""INSERT INTO allocation_defers(allocation_id,from_candidate_id,from_hospital,to_candidate_id,to_hospital,reason,created_at)
+                            VALUES(?,?,?,?,?,?,?)""",
+                         (row["id"], row["candidate_id"], previous["hospital"], nxt["id"], nxt["hospital"], reason, iso()))
+            conn.execute("""UPDATE allocations SET candidate_id=?,response_deadline=?,deferral_count=deferral_count+1,revision=revision+1,updated_at=? WHERE id=?""",
+                         (nxt["id"], new_deadline, iso(), row["id"]))
+            Repository.audit(conn, row["id"], donor["id"], actor, role, "allocation_deferred",
+                             {"from_candidate_id": row["candidate_id"], "from_hospital": previous["hospital"],
+                              "to_candidate_id": nxt["id"], "to_hospital": nxt["hospital"], "reason": reason,
+                              "response_deadline": new_deadline, "deferral_count": row["deferral_count"] + 1})
+
+    def state(self, actor: str, role: str, hospital: str) -> dict[str, Any]:
+        if role in {"coordinator", "allocation_officer"}:
+            with self.repo.tx() as conn:
+                self._sweep_deferrals(conn, actor, role)
         conn = self.repo.conn
         if role == "hospital":
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors WHERE hospital=?", (hospital,))]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates WHERE hospital=?", (hospital,))]
-            allocated = [dict(r) for r in conn.execute("SELECT a.* FROM allocations a JOIN candidates c ON c.id=a.candidate_id WHERE c.hospital=?", (hospital,))]
+            allocated = [dict(r) for r in conn.execute("SELECT a.*,c.hospital current_hospital FROM allocations a JOIN candidates c ON c.id=a.candidate_id WHERE c.hospital=?", (hospital,))]
         elif role == "viewer":
             donors = []
             candidates = []
@@ -318,7 +385,7 @@ class OrganAllocationService:
         else:
             donors = [dict(r) for r in conn.execute("SELECT * FROM donors ORDER BY id DESC")]
             candidates = [dict(r) for r in conn.execute("SELECT * FROM candidates ORDER BY id DESC")]
-            allocated = [dict(r) for r in conn.execute("SELECT * FROM allocations ORDER BY id DESC")]
+            allocated = [dict(r) for r in conn.execute("SELECT a.*,c.hospital current_hospital,c.patient_name current_patient FROM allocations a JOIN candidates c ON c.id=a.candidate_id ORDER BY a.id DESC")]
         return {"donors": donors, "candidates": candidates, "allocations": allocated, "server_time": iso()}
 
 
@@ -339,7 +406,7 @@ class Handler(BaseHTTPRequestHandler):
     def dispatch_get(self, path: str) -> tuple[int, Any]:
         if path == "/health": return 200, {"status": "ok", "service": "organ-allocation"}
         actor, role, hospital = self.service.identity(self.headers)
-        if path == "/api/state": return 200, self.service.state(role, hospital)
+        if path == "/api/state": return 200, self.service.state(actor, role, hospital)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 4 and parts[:2] == ["api", "donors"] and parts[2].isdigit() and parts[3] == "ranking": return 200, self.service.ranking(int(parts[2]), role, hospital)
         if len(parts) == 3 and parts[:2] == ["api", "allocations"] and parts[2].isdigit(): return 200, self.service.get_allocation(int(parts[2]), role, hospital)
