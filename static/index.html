@@ -1,3 +1,30 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>器官分配协调台</title>
-<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}</style>
-<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p><section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await r.json(),null,2)}load()</script>
+<style>body{font:15px system-ui;max-width:1080px;margin:40px auto;background:#f5f7fb;padding:0 20px;color:#172033}section{background:white;padding:20px;border-radius:12px;box-shadow:0 2px 12px #0001;margin-bottom:16px}pre{background:#0f172a;color:#86efac;padding:16px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#be123c;color:white;border:0;border-radius:6px}.card{border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;margin:10px 0}.meta{display:flex;flex-wrap:wrap;gap:8px 24px;margin:8px 0}.tag{background:#fce7f3;color:#9d174d;border-radius:999px;padding:2px 12px;font-size:13px}.tag.urgent{background:#fee2e2;color:#b91c1c}.tag.ok{background:#dcfce7;color:#166534}.tag.gray{background:#e2e8f0;color:#334155}table{border-collapse:collapse;width:100%;margin-top:8px;font-size:13px}th,td{border:1px solid #e2e8f0;padding:5px 8px;text-align:left}th{background:#f8fafc}.queue span{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:6px;padding:2px 8px;margin:2px;font-size:13px}h3{margin:0}</style>
+<h1>器官分配协调台</h1><p>查看当前可用器官、候选患者和分配进度。带应答截止时间的名额，接收医院须在期限内确认；期限过后协调台自动按原排序顺延，页面显示当前医院与顺延次数。写操作通过 JSON API 完成，医院接口需携带 X-Hospital。</p>
+<section><input id="u" value="allocator"><input id="r" value="allocation_officer"><button onclick="load()">刷新协调台</button> <span id="clock"></span></section>
+<section id="desk"></section>
+<section><h3>原始状态</h3><pre id="o"></pre></section>
+<script>
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function statusTag(s){let cls=s==='proposed'?'urgent':['accepted','in_transit','handed_off','implanted'].includes(s)?'ok':'gray';return `<span class="tag ${cls}">${esc(s)}</span>`}
+function card(a){
+  let rows=(a.offers||[]).map(o=>`<tr><td>${o.round}</td><td>第${o.round+1}位</td><td>${esc(o.donor_patient_hospital)} → ${esc(o.candidate_patient_name)}（${esc(o.candidate_hospital)}）</td><td>${esc(o.offered_at)}</td><td>${esc(o.responded_at||'等待应答')}</td><td>${esc(o.reason)}</td></tr>`).join('');
+  let queue=(a.queue||[]).map(q=>`<span>#${q.rank} ${esc(q.patient_name)} · ${esc(q.hospital)}</span>`).join('')||'<span class="tag gray">后面暂无符合条件的候选</span>';
+  let deadline=a.respond_by?`<b>应答截止</b> ${esc(a.respond_by)}`:'<span class="tag gray">旧分配，无截止时间</span>';
+  return `<div class="card"><h3>分配 #${a.id} · ${esc(a.organ||'')} ${esc(a.donor_blood||'')}型（器官医院 ${esc(a.donor_hospital||'')}） ${statusTag(a.status)}</h3>
+  <div class="meta"><span><b>当前医院</b> ${esc(a.current_hospital)}</span><span><b>顺延次数</b> ${a.escalation_count??0}</span><span>${deadline}</span></div>
+  <div class="queue"><b>后续候选（原排序，未拒绝者）：</b><br>${queue}</div>
+  <details ${(a.offers||[]).length>1?'open':''}><summary>双方患者 / 时间 / 原因留痕（${(a.offers||[]).length} 轮）</summary>
+  <table><tr><th>轮次</th><th>顺位</th><th>双方患者与医院</th><th>提出时间</th><th>应答时间</th><th>原因</th></tr>${rows}</table></details></div>`
+}
+async function load(){
+  let r=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});let d=await r.json();
+  clock.textContent='服务器时间：'+(d.server_time||'');
+  o.textContent=JSON.stringify(d,null,2);
+  if(!Array.isArray(d.allocations)){desk.innerHTML='<p>当前角色无分配视图。</p>';return}
+  let rolled=(d.rolled_allocation_ids||[]).length?`<p class="tag urgent">本次扫描已自动顺延 ${d.rolled_allocation_ids.length} 个逾期名额：${d.rolled_allocation_ids.join(', ')}</p>`:'';
+  let missed=d.missed_offers&&d.missed_offers.length?`<p class="tag gray">本院已错过/拒绝 ${d.missed_offers.length} 个名额</p>`:'';
+  desk.innerHTML=rolled+missed+d.allocations.map(card).join('');
+}
+load()
+</script>
